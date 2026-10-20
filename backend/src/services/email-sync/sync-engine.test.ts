@@ -43,7 +43,7 @@ function fakeProvider(messages: NormalizedEmailMessage[]): EmailSyncProvider {
   return {
     dedupePrefix: "gmail",
     notesText: "Synced from Gmail",
-    sortedNewestFirstUnfiltered: false,
+    filtersSinceDateClientSide: false,
     buildSearchQuery: () => "q",
     listCandidateMessageIds: async () => ({ messageIds: [...byId.keys()] }),
     getMessage: async (_u, _a, messageId) => byId.get(messageId) ?? null,
@@ -331,5 +331,211 @@ describe("syncConnectionEmail — WP-11 sender trust integration", () => {
     const billing = await Billing.findOne({ organization: organization._id });
     expect(billing).not.toBeNull();
     expect(billing?.extractionConfidence).toBe(0.9); // untouched, no floor applied
+  });
+});
+
+/**
+ * P1-06 — Outlook can't filter by date server-side, and Graph sorts `$search`
+ * results by SENT time, not received time. The engine used to stop at the
+ * first "old" result and still advance the watermark, permanently skipping
+ * any newer mail listed after it. These tests drive an Outlook-shaped fake
+ * provider (client-side date filtering, pages, a result cap) through the
+ * real syncConnectionEmail loop.
+ */
+describe("syncConnectionEmail — P1-06 client-side date filter (Outlook-shaped provider)", () => {
+  // Watermark → sinceDate = lastSyncedAt − OVERLAP_DAYS (1) = 2026-10-17T10:00Z.
+  const LAST_SYNCED_AT = "2026-10-18T10:00:00.000Z";
+  const NEW = new Date("2026-10-19T09:00:00Z");
+  const OLD = new Date("2026-10-15T09:00:00Z");
+
+  beforeEach(() => {
+    vi.mocked(getEmailSyncProvider).mockReset();
+    vi.mocked(extractInvoiceFields).mockReset();
+  });
+
+  /** One page per inner array; `failOnPage` makes that page's list call throw. */
+  function pagedProvider(
+    pages: NormalizedEmailMessage[][],
+    opts: { failOnPage?: number; maxSearchResults?: number } = {}
+  ) {
+    const byId = new Map(pages.flat().map((m) => [m.id, m]));
+    const getMessage = vi.fn(async (_u: string, _a: string, id: string) => byId.get(id) ?? null);
+    const listCandidateMessageIds = vi.fn(
+      async (_u: string, _a: string, _q: string, _max: number, pageToken?: string) => {
+        const index = pageToken ? Number(pageToken) : 0;
+        if (opts.failOnPage === index) throw new Error("Graph 503");
+        const pageMessages = pages[index] ?? [];
+        return {
+          messageIds: pageMessages.map((m) => m.id),
+          receivedAtById: Object.fromEntries(pageMessages.map((m) => [m.id, m.receivedAt])),
+          nextPageToken: index + 1 < pages.length ? String(index + 1) : undefined,
+        };
+      }
+    );
+    const provider: EmailSyncProvider = {
+      dedupePrefix: "outlook",
+      notesText: "Parsed from an Outlook message",
+      filtersSinceDateClientSide: true,
+      maxSearchResults: opts.maxSearchResults ?? 1000,
+      buildSearchQuery: () => "q",
+      listCandidateMessageIds,
+      getMessage,
+    };
+    return { provider, getMessage, listCandidateMessageIds };
+  }
+
+  async function seedOutlookConnection() {
+    const organization = await Organization.create({ name: "Outlook Test Org", creditsBalance: 10_000 });
+    const connection = await PlatformConnection.create({
+      organization: organization._id,
+      user: new Types.ObjectId(),
+      platform: "microsoft_outlook",
+      accountIdentifier: "owner@example.com",
+      displayName: "Outlook",
+      status: "connected",
+      connectionType: "oauth",
+      metadata: { pipedreamAccountId: "apn_test123", emailSync: { lastSyncedAt: LAST_SYNCED_AT } },
+    });
+    return { organization, connection };
+  }
+
+  async function runSync(connectionId: Types.ObjectId) {
+    const fresh = await PlatformConnection.findById(connectionId);
+    if (!fresh) throw new Error("seed failed");
+    await syncConnectionEmail(fresh);
+    return PlatformConnection.findById(connectionId).lean();
+  }
+
+  function watermarkOf(conn: { metadata?: unknown } | null): string | undefined {
+    return (conn?.metadata as { emailSync?: { lastSyncedAt?: string } } | undefined)?.emailSync
+      ?.lastSyncedAt;
+  }
+
+  it("unsorted results: an old message listed BETWEEN new ones doesn't stop the run — both new ones are processed, the old one is never fetched", async () => {
+    const { connection } = await seedOutlookConnection();
+    // Already handled by an earlier run — must be skipped before any fetch
+    // or AI call (what makes a future one-off rescan free).
+    await ProcessedMessage.create({
+      connection: connection._id,
+      messageId: "msg-already",
+      outcome: "invoice",
+      processedAt: new Date(),
+      expiresAt: new Date(Date.now() + 86_400_000),
+    });
+    mockExtraction({});
+    const { provider, getMessage } = pagedProvider([
+      [
+        message({ id: "msg-new-1", receivedAt: NEW, subject: "Invoice A" }),
+        message({ id: "msg-old", receivedAt: OLD, subject: "Old receipt" }),
+        message({ id: "msg-already", receivedAt: NEW, subject: "Already done" }),
+        message({ id: "msg-new-2", receivedAt: NEW, subject: "Invoice B" }),
+      ],
+    ]);
+    vi.mocked(getEmailSyncProvider).mockReturnValue(provider);
+
+    const after = await runSync(connection._id);
+
+    expect(getMessage.mock.calls.map((c) => c[2])).toEqual(["msg-new-1", "msg-new-2"]);
+    expect(vi.mocked(extractInvoiceFields).mock.calls.map((c) => c[0].subject).sort()).toEqual([
+      "Invoice A",
+      "Invoice B",
+    ]);
+    expect(new Date(watermarkOf(after) ?? 0).getTime()).toBeGreaterThan(
+      new Date(LAST_SYNCED_AT).getTime()
+    );
+  });
+
+  it("multiple pages: every page is read, and a new message on page 2 after an old one on page 1 is processed", async () => {
+    const { connection } = await seedOutlookConnection();
+    mockExtraction({});
+    const { provider, listCandidateMessageIds } = pagedProvider([
+      [message({ id: "msg-old", receivedAt: OLD, subject: "Old receipt" })],
+      [message({ id: "msg-new-p2", receivedAt: NEW, subject: "Invoice on page 2" })],
+    ]);
+    vi.mocked(getEmailSyncProvider).mockReturnValue(provider);
+
+    const after = await runSync(connection._id);
+
+    expect(listCandidateMessageIds).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(extractInvoiceFields).mock.calls.map((c) => c[0].subject)).toEqual([
+      "Invoice on page 2",
+    ]);
+    expect(watermarkOf(after)).not.toBe(LAST_SYNCED_AT);
+  });
+
+  it("failure mid-sync: a page that fails to list leaves the watermark unchanged, records the error, and nothing is marked processed (retried next run)", async () => {
+    const { organization, connection } = await seedOutlookConnection();
+    mockExtraction({});
+    const { provider } = pagedProvider(
+      [
+        [message({ id: "msg-new-p1", receivedAt: NEW, subject: "Invoice on page 1" })],
+        [message({ id: "msg-new-p2", receivedAt: NEW, subject: "Invoice on page 2" })],
+      ],
+      { failOnPage: 1 }
+    );
+    vi.mocked(getEmailSyncProvider).mockReturnValue(provider);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const after = await runSync(connection._id);
+    errorSpy.mockRestore();
+
+    expect(watermarkOf(after)).toBe(LAST_SYNCED_AT);
+    expect(after?.lastSyncStatus).toBe("error");
+    expect(await ProcessedMessage.countDocuments({ connection: connection._id })).toBe(0);
+    expect(await Billing.countDocuments({ organization: organization._id })).toBe(0);
+  });
+
+  it("empty result: nothing is created and the watermark still advances", async () => {
+    const { organization, connection } = await seedOutlookConnection();
+    const { provider, getMessage } = pagedProvider([[]]);
+    vi.mocked(getEmailSyncProvider).mockReturnValue(provider);
+
+    const after = await runSync(connection._id);
+
+    expect(getMessage).not.toHaveBeenCalled();
+    expect(await Billing.countDocuments({ organization: organization._id })).toBe(0);
+    expect(after?.lastSyncStatus).toBe("success");
+    expect(new Date(watermarkOf(after) ?? 0).getTime()).toBeGreaterThan(
+      new Date(LAST_SYNCED_AT).getTime()
+    );
+  });
+
+  it("search result cap reached: the watermark is held and a warning is logged", async () => {
+    const { connection } = await seedOutlookConnection();
+    const { provider } = pagedProvider(
+      [
+        [
+          message({ id: "msg-old-1", receivedAt: OLD }),
+          message({ id: "msg-old-2", receivedAt: OLD }),
+          message({ id: "msg-old-3", receivedAt: OLD }),
+        ],
+      ],
+      { maxSearchResults: 3 }
+    );
+    vi.mocked(getEmailSyncProvider).mockReturnValue(provider);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const after = await runSync(connection._id);
+    const warnings = warnSpy.mock.calls.map((c) => String(c[0]));
+    warnSpy.mockRestore();
+
+    expect(watermarkOf(after)).toBe(LAST_SYNCED_AT);
+    expect(warnings.some((w) => w.includes("cap of 3"))).toBe(true);
+  });
+
+  it("UTC: a message received 1 second before the window is skipped, 1 second inside is processed", async () => {
+    const { connection } = await seedOutlookConnection();
+    mockExtraction({});
+    const { provider } = pagedProvider([
+      [
+        message({ id: "msg-just-before", receivedAt: new Date("2026-10-17T09:59:59Z"), subject: "Before" }),
+        message({ id: "msg-just-inside", receivedAt: new Date("2026-10-17T10:00:01Z"), subject: "Inside" }),
+      ],
+    ]);
+    vi.mocked(getEmailSyncProvider).mockReturnValue(provider);
+
+    await runSync(connection._id);
+
+    expect(vi.mocked(extractInvoiceFields).mock.calls.map((c) => c[0].subject)).toEqual(["Inside"]);
   });
 });

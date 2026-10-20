@@ -2,11 +2,17 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 
 import { buildTestPdf } from "@/services/email-sync/test-helpers/build-test-pdf";
 
-vi.mock("@/services/email-sync/outlook-client", () => ({
-  listCandidateMessageIds: vi.fn(),
-  getMessage: vi.fn(),
-  getAttachments: vi.fn(),
-}));
+vi.mock("@/services/email-sync/outlook-client", async () => {
+  const actual = await vi.importActual<typeof import("@/services/email-sync/outlook-client")>(
+    "@/services/email-sync/outlook-client"
+  );
+  return {
+    parseGraphDateTime: actual.parseGraphDateTime,
+    listCandidateMessageIds: vi.fn(),
+    getMessage: vi.fn(),
+    getAttachments: vi.fn(),
+  };
+});
 
 import { getMessage, getAttachments } from "@/services/email-sync/outlook-client";
 import { OUTLOOK_PROVIDER } from "@/services/email-sync/outlook-provider";

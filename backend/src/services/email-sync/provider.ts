@@ -13,6 +13,10 @@ import type { SenderAuthResults } from "@/services/email-sync/parser";
 export interface EmailCandidatePage {
   messageIds: string[];
   nextPageToken?: string;
+  /** Received time per message id, when the list call already returns it
+   *  (Outlook). Lets the engine skip candidates outside the sync window
+   *  before paying for a full message fetch. Missing ids are processed. */
+  receivedAtById?: Record<string, Date>;
 }
 
 /** One email message reduced to exactly what the AI extractor + parser.ts's
@@ -44,12 +48,17 @@ export interface EmailSyncProvider {
   dedupePrefix: string;
   /** Human-readable source, used in the stored Billing record's `notes`. */
   notesText: string;
-  /** True when `listCandidateMessageIds` is guaranteed to return newest-first
-   *  AND the provider can't narrow its search by date server-side — lets the
-   *  engine stop early once it walks past `sinceDate` instead of relying on
-   *  a server-side date filter (Outlook's `$search` can't combine with a
-   *  `$filter` on receivedDateTime; Gmail's `q=` already narrows by date). */
-  sortedNewestFirstUnfiltered: boolean;
+  /** True when the provider can't narrow its search by date server-side, so
+   *  the engine must skip candidates older than `sinceDate` itself (Outlook's
+   *  `$search` can't combine with a `$filter` on receivedDateTime; Gmail's
+   *  `q=` already narrows by date). No result ORDER is assumed — every page
+   *  is read and each candidate is checked on its own received time, since
+   *  Graph sorts `$search` results by sent time, not received time (P1-06). */
+  filtersSinceDateClientSide: boolean;
+  /** The provider's hard cap on total search results, if any (Graph
+   *  `$search` returns at most 1,000). A run that lists this many can't know
+   *  what lies beyond it, so the engine won't advance the watermark. */
+  maxSearchResults?: number;
   /** `trackedSenders` (from PlatformConnection) scopes the search to those
    *  senders only — a privacy + accuracy win over scanning the whole inbox
    *  with generic keywords. Empty means "no senders configured yet," so the

@@ -2,16 +2,18 @@
  * Outlook's EmailSyncProvider implementation. Unlike Gmail, Microsoft Graph's
  * `$search` on /me/messages CANNOT be combined with a `$filter` on
  * `receivedDateTime` (a 400 error) — so the search query itself carries only
- * keywords. Incremental "since last sync" is instead handled by the engine's
- * client-side early-stop: Graph returns message search results ordered
- * newest-first, so once a message older than `sinceDate` is seen, the run is
- * done (see `sortedNewestFirstUnfiltered` below).
+ * keywords. Incremental "since last sync" is instead handled client-side by
+ * the engine, per message, using the `receivedDateTime` the list call returns
+ * (see `filtersSinceDateClientSide` below). No order is assumed: Graph sorts
+ * `$search` results by SENT time, not received time, so stopping at the first
+ * "old" result could skip newer mail (P1-06).
  */
 import type { EmailSyncProvider } from "@/services/email-sync/provider";
 import {
   listCandidateMessageIds,
   getMessage,
   getAttachments,
+  parseGraphDateTime,
 } from "@/services/email-sync/outlook-client";
 import { stripHtml, parseAuthenticationResults } from "@/services/email-sync/parser";
 import { extractPdfText } from "@/services/email-sync/pdf-extractor";
@@ -93,7 +95,9 @@ function buildSearchQuery(_sinceDate: Date | null, trackedSenders: string[]): st
 export const OUTLOOK_PROVIDER: EmailSyncProvider = {
   dedupePrefix: "outlook",
   notesText: "Parsed from an Outlook message (fallback email sync).",
-  sortedNewestFirstUnfiltered: true,
+  filtersSinceDateClientSide: true,
+  // Graph: "A $search request returns up to 1,000 results."
+  maxSearchResults: 1000,
   buildSearchQuery,
   listCandidateMessageIds,
   async getMessage(externalUserId, pipedreamAccountId, messageId) {
@@ -119,9 +123,7 @@ export const OUTLOOK_PROVIDER: EmailSyncProvider = {
     // call, or subtly break the oldest-to-newest sort in sync-engine.ts
     // (NaN comparisons never behave the way a real timestamp comparison
     // would) — falling back to "now" is a safe default instead.
-    const parsedReceivedAt = message.receivedDateTime ? new Date(message.receivedDateTime) : null;
-    const receivedAt =
-      parsedReceivedAt && !Number.isNaN(parsedReceivedAt.getTime()) ? parsedReceivedAt : new Date();
+    const receivedAt = parseGraphDateTime(message.receivedDateTime) ?? new Date();
 
     return {
       id: message.id,
