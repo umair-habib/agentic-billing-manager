@@ -63,6 +63,25 @@ const TABS = [
 type TabKey = (typeof TABS)[number]["key"];
 const TAB_KEYS: readonly string[] = TABS.map((t) => t.key);
 
+/** A clear, specific message for the chat's expected refusals — out of
+ *  credits (403), a reply already in progress elsewhere, e.g. another tab or
+ *  Slack (409), and too many requests (429) — instead of a generic error. */
+function agentErrorMessage(err: unknown): string {
+  if (!(err instanceof ApiError)) return "Failed to reach the agent. Please try again.";
+  switch (err.status) {
+    case 403:
+      return "You've used all your credits. Add more credits to keep chatting with the Billing Advisor.";
+    case 409:
+      return "Still working on your previous question (maybe in another tab or in Slack). Wait for that reply, then send this again.";
+    case 429:
+      // Two distinct backend causes (per-minute limit vs. workspace busy) —
+      // each already carries its own clear message.
+      return err.message || "Too many requests right now. Please wait a moment and try again.";
+    default:
+      return err.message;
+  }
+}
+
 /** Three-dot "thinking" pulse — quieter than a spinner + label, closer to
  *  the reply-is-coming indicator on Claude.ai/ChatGPT. */
 function ThinkingDots() {
@@ -127,6 +146,9 @@ function AgentViewInner() {
   );
   const [input, setInput] = React.useState("");
   const [sending, setSending] = React.useState(false);
+  // Synchronous twin of `sending`: state updates only land on the next
+  // render, so a fast double Enter/click could otherwise send twice.
+  const sendingRef = React.useRef(false);
   const [error, setError] = React.useState<string | null>(null);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
@@ -191,23 +213,21 @@ function AgentViewInner() {
 
   const sendText = async (raw: string) => {
     const text = raw.trim();
-    if (!text || sending || outOfCredits) return;
+    if (!text || sendingRef.current || outOfCredits) return;
 
     agentChatStore.append({ role: "user", content: text });
     setInput("");
     setError(null);
+    sendingRef.current = true;
     setSending(true);
 
     try {
       const response = await sendAgentMessage(text);
       agentChatStore.append(response.data.message);
     } catch (err) {
-      setError(
-        err instanceof ApiError
-          ? err.message
-          : "Failed to reach the agent. Please try again."
-      );
+      setError(agentErrorMessage(err));
     } finally {
+      sendingRef.current = false;
       setSending(false);
       setCreditsReloadKey((key) => key + 1);
     }

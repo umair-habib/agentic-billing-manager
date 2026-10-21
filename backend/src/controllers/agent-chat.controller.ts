@@ -7,7 +7,6 @@
 import { asyncHandler } from "@/utils/asyncHandler";
 import { AppError } from "@/utils/appError";
 import { sendSuccess } from "@/utils/apiResponse";
-import { assertCreditBalance } from "@/utils/credits";
 import {
   sendAgentMessage,
   resetAgentSession,
@@ -25,7 +24,7 @@ export const agentChat = asyncHandler(async (req, res) => {
 
   const { message } = req.body as AgentChatInput;
 
-  // WP-7 intent router (flow/04 §8) — tried BEFORE the credit check, on
+  // WP-7 intent router (flow/04 §8) — tried BEFORE the credit reservation, on
   // purpose: a deterministic answer costs nothing and must still work for a
   // workspace that's genuinely out of AI credits. Falls through to the real
   // agent turn below (unchanged) on anything not confidently matched.
@@ -37,8 +36,9 @@ export const agentChat = asyncHandler(async (req, res) => {
     return;
   }
 
-  await assertCreditBalance(organization._id);
-
+  // Credits are reserved inside sendAgentMessage (403 when out, 409 if this
+  // chat already has a reply in progress, 429 over the workspace's
+  // concurrency cap) — no separate pre-check needed here.
   const { reply, action } = await sendAgentMessage(user._id, organization._id, message);
 
   sendSuccess(res, 200, "Agent response generated", {

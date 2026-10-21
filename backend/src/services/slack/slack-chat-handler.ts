@@ -17,7 +17,6 @@ import { Types } from "mongoose";
 
 import { AppError } from "@/utils/appError";
 import { decryptSecret } from "@/utils/crypto";
-import { assertCreditBalance } from "@/utils/credits";
 import { User, type UserDocument } from "@/models/user.model";
 import { Membership } from "@/models/membership.model";
 import { SlackProcessedEvent } from "@/models/slack-processed-event.model";
@@ -159,7 +158,7 @@ export async function handleSlackChatEvent(
     }
 
     // WP-7 intent router — same reasoning as the web chat controller: tried
-    // before the credit check, so a deterministic answer works even when
+    // before the credit reservation, so a deterministic answer works even when
     // this workspace is out of AI credits.
     const routed = await tryRouteDeterministically(organization._id.toString(), text);
     if (routed) {
@@ -167,11 +166,20 @@ export async function handleSlackChatEvent(
       return;
     }
 
-    await assertCreditBalance(organization._id);
-
+    // Credits are reserved inside sendAgentMessage — same 403 when out.
     const { reply: agentReply, action } = await sendAgentMessage(user._id, organization._id, text);
     await reply(action ? `${agentReply}\n\n${actionHint(action)}` : agentReply);
   } catch (err) {
+    // A DM sent while this user's previous question is still being answered
+    // (409 from agent-concurrency.ts) — a friendly nudge, not a ⚠️ error.
+    if (err instanceof AppError && err.statusCode === 409) {
+      await reply(
+        "⏳ Still working on your previous question — I'll reply to it first. Send this one again once you have that answer."
+      ).catch(() => {
+        // Best-effort — nothing else to do if even this reply fails.
+      });
+      return;
+    }
     const message =
       err instanceof AppError ? err.message : "Mujhe jawab dete waqt masla hua, dobara try karein.";
     await reply(`⚠️ ${message}`).catch(() => {

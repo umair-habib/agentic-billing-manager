@@ -14,8 +14,14 @@ import { AppError } from "@/utils/appError";
 import { AgentSession } from "@/models/agent-session.model";
 import { executeCustomTool } from "@/services/agent/agent-tools";
 import { sanitizeForAgentContext } from "@/utils/sanitize-untrusted-text";
-import { consumeCredits } from "@/services/credits/credit-ledger.service";
-import { tokensToCredits } from "@/config/credits";
+import { reserveCredits, settleReservation } from "@/services/credits/credit-ledger.service";
+import {
+  tokensToCredits,
+  AGENT_TURN_RESERVE_CREDITS,
+  AGENT_TURN_TIMEOUT_MS,
+  AGENT_INTERRUPT_DRAIN_MS,
+} from "@/config/credits";
+import { acquireAgentTurnSlot } from "@/services/agent/agent-concurrency";
 import type { ConnectionRequirements } from "@/services/integrations/capability-resolver";
 import type {
   ProposeUpdateStatusResult,
@@ -191,6 +197,133 @@ export async function resetAllAgentSessionsForUser(userId: Types.ObjectId | stri
   await AgentSession.deleteMany({ user: userId });
 }
 
+const OUT_OF_CREDITS_MESSAGE =
+  "This workspace has used all its credits. Add more credits to keep chatting with the Billing Advisor.";
+
+/** Token/runtime usage accumulated across one turn's model requests. */
+interface TurnUsage {
+  modelRequests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+}
+
+function emptyUsage(): TurnUsage {
+  return {
+    modelRequests: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+  };
+}
+
+function addModelUsage(
+  usage: TurnUsage,
+  modelUsage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+  }
+): void {
+  usage.modelRequests++;
+  usage.inputTokens += modelUsage.input_tokens;
+  usage.outputTokens += modelUsage.output_tokens;
+  usage.cacheCreationInputTokens += modelUsage.cache_creation_input_tokens;
+  usage.cacheReadInputTokens += modelUsage.cache_read_input_tokens;
+}
+
+/** A turn's real cost in credits. A turn that never reached the model (it
+ *  failed first) costs nothing, so its whole reservation is refunded. */
+function actualTurnCredits(usage: TurnUsage, startedAt: number): number {
+  if (usage.modelRequests === 0) return 0;
+  return tokensToCredits(usage.inputTokens, usage.outputTokens, {
+    cacheCreationInputTokens: usage.cacheCreationInputTokens,
+    cacheReadInputTokens: usage.cacheReadInputTokens,
+    sessionSeconds: (Date.now() - startedAt) / 1000,
+  });
+}
+
+const READ_TIMED_OUT = Symbol("read-timed-out");
+
+/**
+ * Reads a session's event stream under a deadline (CLAUDE.md §10.3 P1-10).
+ * When the turn runs past AGENT_TURN_TIMEOUT_MS — or the caller calls
+ * `interrupt()` (the tool-call hard limit) — it sends `user.interrupt`, so
+ * the session genuinely stops on Anthropic's side instead of running on
+ * uncharged, then keeps reading for up to AGENT_INTERRUPT_DRAIN_MS so the
+ * final `span.model_request_end` usage events are still counted before
+ * settling. `next()` returns null once the stream ends or the drain window
+ * closes.
+ */
+function createTurnReader<E>(
+  anthropic: Anthropic,
+  sessionId: string,
+  stream: AsyncIterable<E>,
+  startedAt: number
+) {
+  const iterator = stream[Symbol.asyncIterator]();
+  let deadline = startedAt + AGENT_TURN_TIMEOUT_MS;
+  const state = { interrupted: false, timedOut: false };
+
+  const interrupt = async (): Promise<void> => {
+    if (state.interrupted) return;
+    state.interrupted = true;
+    deadline = Date.now() + AGENT_INTERRUPT_DRAIN_MS;
+    await anthropic.beta.sessions.events
+      .send(sessionId, { events: [{ type: "user.interrupt" }] })
+      .catch(() => {
+        // Best-effort — the drain window below still bounds the wait.
+      });
+  };
+
+  // A read that lost the race to the deadline is kept and re-awaited on the
+  // next call — never replaced by a fresh `iterator.next()`, which would
+  // silently drop whatever event the first read eventually resolves with
+  // (possibly the very usage event the drain window exists to catch).
+  let pendingRead: Promise<IteratorResult<E>> | null = null;
+
+  const nextBeforeDeadline = async (): Promise<IteratorResult<E> | typeof READ_TIMED_OUT> => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return READ_TIMED_OUT;
+    pendingRead ??= iterator.next();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<typeof READ_TIMED_OUT>((resolve) => {
+      timer = setTimeout(() => resolve(READ_TIMED_OUT), remaining);
+    });
+    try {
+      const result = await Promise.race([pendingRead, timeout]);
+      if (result !== READ_TIMED_OUT) pendingRead = null;
+      return result;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const next = async (): Promise<E | null> => {
+    for (;;) {
+      const result = await nextBeforeDeadline();
+      if (result === READ_TIMED_OUT) {
+        if (state.interrupted) return null; // drain window over
+        state.timedOut = true;
+        await interrupt();
+        continue;
+      }
+      return result.done ? null : result.value;
+    }
+  };
+
+  const close = (): void => {
+    void Promise.resolve(iterator.return?.()).catch(() => {
+      // Best-effort — closing an already-finished stream is fine.
+    });
+  };
+
+  return { next, interrupt, close, state };
+}
+
 /**
  * Runs ONE prompt through the Billing Advisor Agent on a throwaway session —
  * created fresh and archived immediately after, never touching the user's
@@ -204,30 +337,46 @@ export async function runAgentPrompt(
   prompt: string
 ): Promise<string> {
   const anthropic = getClient();
-  const sessionStartedAt = Date.now();
-  const session = await anthropic.beta.sessions.create({
-    agent: env.anthropicAgentId,
-    environment_id: env.anthropicEnvironmentId,
-    title: `Recommendation refresh — user ${userId.toString()}`,
-  });
 
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheCreationInputTokens = 0;
-  let cacheReadInputTokens = 0;
+  // CLAUDE.md §10.3 P1-10 — this background path used to have no credit
+  // gate at all, so a workspace already at 0 kept paying for recommendation
+  // refreshes. Reserve first; recommendation-engine.ts treats this 403 as
+  // "skipped, out of credits".
+  const reservation = await reserveCredits(
+    organizationId,
+    AGENT_TURN_RESERVE_CREDITS,
+    "recommendation_generation",
+    userId
+  );
+  if (!reservation) throw new AppError(OUT_OF_CREDITS_MESSAGE, 403);
+
+  const sessionStartedAt = Date.now();
+  const usage = emptyUsage();
+  let sessionId: string | null = null;
+  let reader: ReturnType<typeof createTurnReader> | null = null;
   try {
+    const session = await anthropic.beta.sessions.create({
+      agent: env.anthropicAgentId,
+      environment_id: env.anthropicEnvironmentId,
+      title: `Recommendation refresh — user ${userId.toString()}`,
+    });
+    sessionId = session.id;
+
     const stream = await anthropic.beta.sessions.events.stream(session.id);
     await anthropic.beta.sessions.events.send(session.id, {
       events: [{ type: "user.message", content: [{ type: "text", text: prompt }] }],
     });
+    const turnReader = createTurnReader(anthropic, session.id, stream, sessionStartedAt);
+    reader = turnReader;
 
     let reply = "";
-    for await (const event of stream) {
+    for (let event = await turnReader.next(); event; event = await turnReader.next()) {
       if (event.type === "agent.message") {
         for (const block of event.content) {
           if (block.type === "text") reply += block.text;
         }
       } else if (event.type === "agent.custom_tool_use") {
+        if (turnReader.state.interrupted) continue;
         // Not relevant to a one-shot generation task — decline so the session
         // can still terminate cleanly instead of waiting on a result forever.
         await anthropic.beta.sessions.events.send(session.id, {
@@ -244,10 +393,7 @@ export async function runAgentPrompt(
         // Same accounting as a chat turn (see sendAgentMessage below) — a
         // background generation call costs real tokens too, and skipping
         // this tracking would leave it invisible on the workspace's ledger.
-        inputTokens += event.model_usage.input_tokens;
-        outputTokens += event.model_usage.output_tokens;
-        cacheCreationInputTokens += event.model_usage.cache_creation_input_tokens;
-        cacheReadInputTokens += event.model_usage.cache_read_input_tokens;
+        addModelUsage(usage, event.model_usage);
       } else if (event.type === "session.status_terminated") {
         break;
       } else if (event.type === "session.status_idle") {
@@ -258,39 +404,38 @@ export async function runAgentPrompt(
     }
 
     if (!reply.trim()) {
-      throw new AppError("The AI agent didn't return a response.", 502);
+      throw new AppError(
+        turnReader.state.timedOut
+          ? "The AI agent took too long to respond."
+          : "The AI agent didn't return a response.",
+        turnReader.state.timedOut ? 504 : 502
+      );
     }
     return reply;
   } finally {
-    // Deduct AFTER the turn (actual cost is only known once it's done),
-    // even if the loop above threw — the API call already happened either
-    // way. Awaited (not fire-and-forget, CLAUDE.md §10.3) so a ledger-write
-    // failure is at least visible to whatever's awaiting this function,
-    // rather than silently lost — consumeCredits itself never throws (see
-    // its own best-effort guarantee), so this can't mask the real error
-    // from the try block above.
-    await consumeCredits(
-      organizationId,
-      tokensToCredits(inputTokens, outputTokens, {
-        cacheCreationInputTokens,
-        cacheReadInputTokens,
-        sessionSeconds: (Date.now() - sessionStartedAt) / 1000,
-      }),
-      "recommendation_generation",
-      userId
-    );
-    await anthropic.beta.sessions.archive(session.id).catch(() => {
-      // Best-effort cleanup — a stray unarchived session is not fatal.
-    });
+    reader?.close();
+    // Settle AFTER the turn (actual cost is only known once it's done), even
+    // if the loop above threw — the API call already happened either way.
+    // settleReservation never throws, so this can't mask the real error.
+    await settleReservation(reservation.reservationId, actualTurnCredits(usage, sessionStartedAt));
+    if (sessionId) {
+      await anthropic.beta.sessions.archive(sessionId).catch(() => {
+        // Best-effort cleanup — a stray unarchived session is not fatal.
+      });
+    }
   }
 }
 
 /**
  * Sends one user message to the user's agent session and waits for the
- * agent's reply, returning the concatenated text of its response.
+ * agent's reply, returning the concatenated text of its response. Used by
+ * both the web chat and Slack.
  *
- * Stream-first: the event stream is opened before the message is sent, so no
- * events are missed (see Anthropic's Managed Agents client-patterns guide).
+ * CLAUDE.md §10.3 P1-10 / S-10 — spend controls, in order: one turn at a
+ * time per chat session and a per-workspace concurrency cap
+ * (agent-concurrency.ts, 409/429), then an atomic credit reservation (403
+ * when the workspace is out), then the turn itself, then settlement to the
+ * real cost — always, even when the turn throws.
  */
 export async function sendAgentMessage(
   userId: Types.ObjectId | string,
@@ -298,35 +443,73 @@ export async function sendAgentMessage(
   text: string
 ): Promise<AgentReply> {
   const anthropic = getClient();
+  const releaseSlot = acquireAgentTurnSlot(userId, organizationId);
+  try {
+    const reservation = await reserveCredits(
+      organizationId,
+      AGENT_TURN_RESERVE_CREDITS,
+      "agent_message",
+      userId
+    );
+    if (!reservation) throw new AppError(OUT_OF_CREDITS_MESSAGE, 403);
+
+    const turnStartedAt = Date.now();
+    const usage = emptyUsage();
+    try {
+      return await runChatTurn(anthropic, userId, organizationId, text, usage, turnStartedAt);
+    } finally {
+      await settleReservation(reservation.reservationId, actualTurnCredits(usage, turnStartedAt));
+    }
+  } finally {
+    releaseSlot();
+  }
+}
+
+/**
+ * One chat turn on the user's persisted session. Stream-first: the event
+ * stream is opened before the message is sent, so no events are missed (see
+ * Anthropic's Managed Agents client-patterns guide). Accumulates model usage
+ * into `usage` as it goes, so the caller can settle even if this throws.
+ */
+async function runChatTurn(
+  anthropic: Anthropic,
+  userId: Types.ObjectId | string,
+  organizationId: Types.ObjectId | string,
+  text: string,
+  usage: TurnUsage,
+  turnStartedAt: number
+): Promise<AgentReply> {
   const sessionId = await getOrCreateSessionId(userId, organizationId);
-  const turnStartedAt = Date.now();
 
   const stream = await anthropic.beta.sessions.events.stream(sessionId);
   await anthropic.beta.sessions.events.send(sessionId, {
     events: [{ type: "user.message", content: [{ type: "text", text }] }],
   });
+  const reader = createTurnReader(anthropic, sessionId, stream, turnStartedAt);
 
   let reply = "";
   let action: AgentAction | undefined;
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheCreationInputTokens = 0;
-  let cacheReadInputTokens = 0;
   let toolIterations = 0;
   try {
-    for await (const event of stream) {
+    for (let event = await reader.next(); event; event = await reader.next()) {
       if (event.type === "agent.message") {
         for (const block of event.content) {
           if (block.type === "text") reply += block.text;
         }
       } else if (event.type === "agent.custom_tool_use") {
+        // Interrupted (hard limit or timeout): no more tool results — just
+        // keep draining for the final usage events.
+        if (reader.state.interrupted) continue;
         toolIterations++;
 
-        // WP-7 — the hard ceiling: stop reading the stream entirely rather
-        // than send yet another tool result, regardless of what the model
-        // does next. See MAX_TOOL_ITERATIONS_HARD's own docstring.
+        // WP-7 — the hard ceiling: send no further tool results, regardless
+        // of what the model does next. See MAX_TOOL_ITERATIONS_HARD's own
+        // docstring. Interrupts the session (instead of just ceasing to
+        // read, which left it running — and costing — unseen) and drains
+        // the remaining usage events so they're still charged.
         if (toolIterations > MAX_TOOL_ITERATIONS_HARD) {
-          break;
+          await reader.interrupt();
+          continue;
         }
 
         // The soft ceiling: tell the model it's out of room, the same
@@ -440,10 +623,7 @@ export async function sendAgentMessage(
       } else if (event.type === "span.model_request_end") {
         // A turn can involve multiple model requests (e.g. one per tool round
         // trip) — accumulate across the whole turn, not just the first one.
-        inputTokens += event.model_usage.input_tokens;
-        outputTokens += event.model_usage.output_tokens;
-        cacheCreationInputTokens += event.model_usage.cache_creation_input_tokens;
-        cacheReadInputTokens += event.model_usage.cache_read_input_tokens;
+        addModelUsage(usage, event.model_usage);
       } else if (event.type === "session.status_terminated") {
         break;
       } else if (event.type === "session.status_idle") {
@@ -458,29 +638,18 @@ export async function sendAgentMessage(
       }
     }
   } finally {
-    // Deduct AFTER the turn — actual cost is only known once it's done.
-    // Awaited (not fire-and-forget, CLAUDE.md §10.3) so a ledger-write
-    // failure is at least visible rather than silently lost. Wrapped in
-    // `finally` (previously this ran only on a clean loop exit) so a mid-
-    // turn `session.error` throw above still gets charged for whatever
-    // tokens it already consumed before failing, instead of that real cost
-    // going completely unrecorded.
-    await consumeCredits(
-      organizationId,
-      tokensToCredits(inputTokens, outputTokens, {
-        cacheCreationInputTokens,
-        cacheReadInputTokens,
-        sessionSeconds: (Date.now() - turnStartedAt) / 1000,
-      }),
-      "agent_message",
-      userId
-    );
+    // Settlement (charging what the turn really used — including tokens
+    // spent before a mid-turn `session.error`) happens in sendAgentMessage's
+    // own `finally`, from the `usage` accumulated above.
+    reader.close();
   }
 
   if (!reply.trim()) {
     throw new AppError(
-      "The AI agent didn't return a response. Please try again.",
-      502
+      reader.state.timedOut
+        ? "The AI agent took too long to answer. Please try again."
+        : "The AI agent didn't return a response. Please try again.",
+      reader.state.timedOut ? 504 : 502
     );
   }
 

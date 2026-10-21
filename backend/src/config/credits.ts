@@ -136,3 +136,21 @@ export function tokensToCredits(
 
   return Math.max(1, Math.ceil(tokenCredits + sessionCredits));
 }
+
+// ── Agent spend controls (CLAUDE.md §10.3 P1-10 / S-10) ─────────────────────
+
+/** Credits atomically reserved before a Billing Advisor Agent turn starts
+ *  (or the workspace's whole remaining balance, if smaller), then settled to
+ *  the turn's real cost afterwards — see credit-ledger.service.ts's
+ *  `reserveCredits`/`settleReservation`. */
+export const AGENT_TURN_RESERVE_CREDITS = 25;
+
+/** Max agent turns running at once per workspace (web + Slack combined). */
+export const AGENT_MAX_CONCURRENT_PER_WORKSPACE = 3;
+
+/** A turn still running after this long is interrupted (`user.interrupt`). */
+export const AGENT_TURN_TIMEOUT_MS = 120_000;
+
+/** After an interrupt, how long to keep reading the stream for the final
+ *  usage events before settling with whatever was received. */
+export const AGENT_INTERRUPT_DRAIN_MS = 10_000;

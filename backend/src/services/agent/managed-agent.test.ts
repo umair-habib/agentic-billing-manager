@@ -45,6 +45,13 @@ function toolUseEvent(id: string, name = "unknown_test_tool") {
   return { type: "agent.custom_tool_use", id, name, input: {} };
 }
 
+/** A real workspace with credits — sendAgentMessage reserves credits before
+ *  every turn (P1-10), so a made-up organization id is refused with 403. */
+async function fundedOrgId(): Promise<Types.ObjectId> {
+  const organization = await Organization.create({ name: "Funded Test Org", creditsBalance: 1000 });
+  return organization._id;
+}
+
 describe("sendAgentMessage (WP-7 — MAX_ITERATIONS + org-scoped sessions)", () => {
   // Same cross-file leak risk as stripe-subscription.test.ts's identical
   // fix — `env`'s properties are mutated directly (not via vi.stubEnv), so
@@ -90,7 +97,7 @@ describe("sendAgentMessage (WP-7 — MAX_ITERATIONS + org-scoped sessions)", () 
     eventsStreamMock.mockResolvedValue(fakeStream(events));
 
     const userId = new Types.ObjectId();
-    const orgId = new Types.ObjectId();
+    const orgId = await fundedOrgId();
     const result = await sendAgentMessage(userId, orgId, "do a lot of things");
 
     expect(result.reply).toBe("Here's what I found.");
@@ -106,35 +113,55 @@ describe("sendAgentMessage (WP-7 — MAX_ITERATIONS + org-scoped sessions)", () 
     expect(declineSends).toHaveLength(2); // calls 9 and 10 (over the soft limit of 8)
   });
 
-  it("the hard limit forces the loop to stop even if the model keeps calling tools indefinitely", async () => {
+  it("the hard limit interrupts the session and sends no more tool results, even if the model keeps calling tools", async () => {
     // Far more tool-use events than even the hard limit (12) — a model
-    // that never stops. The stream itself has 30 events queued up; the
-    // service must never consume anywhere near all of them.
+    // that never stops — then, once interrupted, the session's final usage
+    // and idle events (P1-10: the interrupt actually stops the session, and
+    // the drain still counts the tokens it used).
     const events = [
       ...Array.from({ length: 30 }, (_, i) => toolUseEvent(`call_${i}`)),
-      { type: "agent.message", content: [{ type: "text", text: "should never be reached" }] },
+      {
+        type: "span.model_request_end",
+        model_usage: {
+          input_tokens: 5000,
+          output_tokens: 5000,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+      },
+      { type: "session.status_idle", stop_reason: { type: "end_turn" } },
     ];
     eventsStreamMock.mockResolvedValue(fakeStream(events));
 
     const userId = new Types.ObjectId();
-    const orgId = new Types.ObjectId();
+    const orgId = await fundedOrgId();
 
-    // No text reply is ever produced (the loop breaks before reaching the
-    // trailing agent.message), so this surfaces as the existing
-    // "didn't return a response" error — the important assertion is that
-    // the call actually RESOLVES (rejects) in finite time at all, proving
-    // the loop terminated rather than consuming all 30 events.
-    await expect(sendAgentMessage(userId, orgId, "loop forever")).rejects.toThrow();
+    // No text reply is ever produced, so this surfaces as the existing
+    // "didn't return a response" error — what matters is that it finishes
+    // at all, and how it stopped.
+    await expect(sendAgentMessage(userId, orgId, "loop forever")).rejects.toThrow(
+      "didn't return a response"
+    );
 
-    // At most 12 (hard limit) + 1 (the initial user.message) sends — proof
-    // the loop stopped well short of all 30 tool-use events.
-    expect(eventsSendMock.mock.calls.length).toBeLessThanOrEqual(13);
+    const sentTypes = eventsSendMock.mock.calls.map(
+      (call) => (call[1] as { events: Array<{ type: string }> }).events[0]?.type
+    );
+    // 1 user.message + 12 tool results (8 normal + 4 "limit reached") + 1 interrupt.
+    expect(sentTypes.filter((t) => t === "user.custom_tool_result")).toHaveLength(12);
+    expect(sentTypes.filter((t) => t === "user.interrupt")).toHaveLength(1);
+
+    // The drained usage was charged: 10,000 tokens = 10 credits, plus a
+    // tiny session-runtime charge that tokensToCredits rounds up to 11.
+    const reloaded = await Organization.findById(orgId);
+    const charged = 1000 - (reloaded?.creditsBalance ?? 1000);
+    expect(charged).toBeGreaterThanOrEqual(10);
+    expect(charged).toBeLessThanOrEqual(11);
   });
 
   it("two different organizations for the same user get two independent session rows", async () => {
     const userId = new Types.ObjectId();
-    const orgA = new Types.ObjectId();
-    const orgB = new Types.ObjectId();
+    const orgA = await fundedOrgId();
+    const orgB = await fundedOrgId();
 
     sessionsCreateMock
       .mockResolvedValueOnce({ id: "sesn_org_a" })
