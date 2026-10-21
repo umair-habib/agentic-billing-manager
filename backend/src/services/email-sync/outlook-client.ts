@@ -42,11 +42,23 @@ export interface OutlookListPage {
   messageIds: string[];
   /** The full `@odata.nextLink` URL — opaque to the caller, just like Gmail's pageToken. */
   nextPageToken?: string;
+  /** Each listed message's received time (UTC), when Graph returned a valid one. */
+  receivedAtById: Record<string, Date>;
 }
 
 interface RawListResponse {
-  value?: { id?: string }[];
+  value?: { id?: string; receivedDateTime?: string }[];
   "@odata.nextLink"?: string;
+}
+
+/** Graph's DateTimeOffset values are UTC ("…Z") by default, but a value
+ *  without any zone designator would be read by `new Date()` as LOCAL time —
+ *  so treat a zone-less value as UTC explicitly. Null if missing/invalid. */
+export function parseGraphDateTime(value: string | undefined): Date | null {
+  if (!value) return null;
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value.trim());
+  const parsed = new Date(hasZone ? value : `${value}Z`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 /**
@@ -67,7 +79,7 @@ export async function listCandidateMessageIds(
     `${GRAPH_API_BASE}/messages?${new URLSearchParams({
       $search: query,
       $top: String(maxResults),
-      $select: "id",
+      $select: "id,receivedDateTime",
     }).toString()}`;
 
   const data = (await connectProxyRequest(
@@ -76,12 +88,16 @@ export async function listCandidateMessageIds(
     url
   )) as RawListResponse | null;
 
-  return {
-    messageIds: (data?.value ?? [])
-      .map((m) => m.id)
-      .filter((id): id is string => Boolean(id)),
-    nextPageToken: data?.["@odata.nextLink"],
-  };
+  const messageIds: string[] = [];
+  const receivedAtById: Record<string, Date> = {};
+  for (const m of data?.value ?? []) {
+    if (!m.id) continue;
+    messageIds.push(m.id);
+    const receivedAt = parseGraphDateTime(m.receivedDateTime);
+    if (receivedAt) receivedAtById[m.id] = receivedAt;
+  }
+
+  return { messageIds, nextPageToken: data?.["@odata.nextLink"], receivedAtById };
 }
 
 /** Fetches one message's subject/body/sender/received date. Null on any

@@ -114,7 +114,7 @@ export const GMAIL_PROVIDER: EmailSyncProvider = {
   notesText: "Parsed from a Gmail message (fallback email sync).",
   // Gmail's `q=` query already narrows server-side by date — no client-side
   // early-stop needed (and its search results aren't reliably newest-first).
-  sortedNewestFirstUnfiltered: false,
+  filtersSinceDateClientSide: false,
   buildSearchQuery,
   listCandidateMessageIds,
   async getMessage(externalUserId, pipedreamAccountId, messageId) {

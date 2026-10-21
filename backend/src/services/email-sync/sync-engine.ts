@@ -222,8 +222,10 @@ async function syncConnectionEmailInner(
   let processed = 0;
   let created = 0;
   let hitCap = false;
-  let stoppedEarly = false;
   let outOfCredits = false;
+  // Every candidate id the provider listed this run, across all pages —
+  // compared against `provider.maxSearchResults` to detect a truncated search.
+  let listedCount = 0;
   // Counts messages that couldn't actually be checked (a real API/network
   // failure from the AI extractor, or an unexpected bug) — as opposed to a
   // message that WAS successfully checked and simply wasn't a bill. If
@@ -264,7 +266,23 @@ async function syncConnectionEmailInner(
         PAGE_SIZE,
         pageToken
       );
+      listedCount += page.messageIds.length;
       for (const messageId of page.messageIds) {
+        // Providers that can't filter by date server-side (Outlook): skip a
+        // candidate received before the window, judged on its OWN received
+        // time — never "stop at the first old one", since results aren't in
+        // received-time order (P1-06). Skipped before any fetch, so it costs
+        // nothing and doesn't count toward MAX_MESSAGES_PER_RUN.
+        const listedReceivedAt = page.receivedAtById?.[messageId];
+        if (
+          provider.filtersSinceDateClientSide &&
+          sinceDate &&
+          listedReceivedAt &&
+          listedReceivedAt.getTime() < sinceDate.getTime()
+        ) {
+          continue;
+        }
+
         // The actual fix for the re-extraction loop: a message already
         // recorded here — from THIS run's own earlier page, or any previous
         // run, however many times it keeps reappearing inside the rolling
@@ -297,16 +315,15 @@ async function syncConnectionEmailInner(
           );
           if (!message) continue;
 
-          // Some providers (Outlook) can't narrow their search by date
-          // server-side — their results are newest-first, so walking past
-          // `sinceDate` means everything after this point was already synced.
+          // Fallback for a candidate the list call gave no received time for:
+          // same per-message check, now on the fetched message — skip this
+          // one only, keep going (never a run-ending break, see above).
           if (
-            provider.sortedNewestFirstUnfiltered &&
+            provider.filtersSinceDateClientSide &&
             sinceDate &&
             message.receivedAt.getTime() < sinceDate.getTime()
           ) {
-            stoppedEarly = true;
-            break;
+            continue;
           }
 
           const extracted = await extractCandidateFields(
@@ -344,7 +361,7 @@ async function syncConnectionEmailInner(
           extractionErrors++;
         }
       }
-      pageToken = hitCap || stoppedEarly || outOfCredits ? undefined : page.nextPageToken;
+      pageToken = hitCap || outOfCredits ? undefined : page.nextPageToken;
     } while (pageToken);
 
     // Commit oldest-first: within one run, a later email for the same
@@ -488,9 +505,10 @@ async function syncConnectionEmailInner(
     // message failed to actually get checked (a systemic AI-extractor
     // failure, not a real "not a bill" verdict), leave it unchanged so the
     // next run resumes the same backlog instead of silently skipping
-    // whatever didn't get through. Stopping early because the results ran
-    // past `sinceDate` (Outlook) IS a fully-drained window, so it still
-    // advances the watermark.
+    // whatever didn't get through. A search truncated at the provider's own
+    // result cap (Outlook `$search`: 1,000) is likewise NOT fully drained —
+    // anything past that position was never listed — so it holds the
+    // watermark too, same reasoning as `hitCap` below.
     //
     // `hitCap` deliberately still blocks the advance even now that
     // ProcessedMessage exists. Advancing it to "now" after a capped run
@@ -504,7 +522,14 @@ async function syncConnectionEmailInner(
     // That is what actually makes GM-004's "run 1: first 200, run 2: the
     // next 200, run 3: the final 100" backfill-completion behavior work.
     const allAttemptsFailed = processed > 0 && extractionErrors === processed;
-    if (!hitCap && !outOfCredits && !allAttemptsFailed) {
+    const searchCapReached =
+      provider.maxSearchResults !== undefined && listedCount >= provider.maxSearchResults;
+    if (searchCapReached) {
+      console.warn(
+        `[email-sync] connection ${connection._id.toString()} (${connection.platform}): search returned ${listedCount} results, the provider's cap of ${provider.maxSearchResults} — older matches beyond it may be missed; watermark not advanced.`
+      );
+    }
+    if (!hitCap && !outOfCredits && !allAttemptsFailed && !searchCapReached) {
       await PlatformConnection.updateOne(
         { _id: connection._id },
         { $set: { "metadata.emailSync": { lastSyncedAt: runStartedAt.toISOString() } } }
