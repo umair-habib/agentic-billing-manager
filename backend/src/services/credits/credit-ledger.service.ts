@@ -13,6 +13,7 @@
 import type { Types } from "mongoose";
 
 import { Organization } from "@/models/organization.model";
+import { CreditReservation } from "@/models/credit-reservation.model";
 import {
   CreditTransaction,
   type CreditTransactionType,
@@ -72,6 +73,107 @@ export async function consumeCredits(
     await applyDelta(organizationId, "consume", -Math.abs(amount), reason, userId);
   } catch {
     // Best-effort — see docstring.
+  }
+}
+
+export interface CreditReservationHandle {
+  reservationId: string;
+  reserved: number;
+}
+
+/** Bounded retries for the compare-and-set below — only contended when
+ *  several turns for the same workspace reserve in the same instant. */
+const RESERVE_MAX_ATTEMPTS = 5;
+
+/**
+ * CLAUDE.md §10.3 P1-10 / S-10 — atomically takes `min(maxCredits, balance)`
+ * credits from a workspace BEFORE an AI call, so N concurrent turns can't
+ * all pass a "balance > 0" check and then each overspend. Returns null when
+ * the workspace has less than 1 credit (nothing reserved, nothing written).
+ *
+ * Compare-and-set on the exact balance read, rather than an update pipeline:
+ * the decrement only lands if nobody else changed the balance in between,
+ * otherwise it re-reads and retries. Goes through the normal ledger (a
+ * "consume" row), so sum(CreditTransaction) === creditsBalance still holds
+ * at every moment (credit-reconciliation-scheduler.ts), and a crash mid-turn
+ * leaves the customer charged the reservation only — never a stuck balance.
+ */
+export async function reserveCredits(
+  organizationId: Types.ObjectId | string,
+  maxCredits: number,
+  reason: string,
+  userId?: Types.ObjectId | string
+): Promise<CreditReservationHandle | null> {
+  for (let attempt = 0; attempt < RESERVE_MAX_ATTEMPTS; attempt++) {
+    const current = await Organization.findById(organizationId).select("creditsBalance");
+    if (!current || current.creditsBalance < 1) return null;
+
+    const reserved = Math.min(Math.abs(maxCredits), current.creditsBalance);
+    const updated = await Organization.findOneAndUpdate(
+      { _id: organizationId, creditsBalance: current.creditsBalance },
+      { $inc: { creditsBalance: -reserved } },
+      { new: true }
+    );
+    if (!updated) continue; // balance moved under us — re-read and retry
+
+    const reservation = await CreditReservation.create({
+      organization: organizationId,
+      user: userId,
+      reason,
+      reserved,
+    });
+    await CreditTransaction.create({
+      organization: organizationId,
+      user: userId,
+      type: "consume",
+      amount: -reserved,
+      balanceAfter: updated.creditsBalance,
+      reason: `${reason} (reserved ${reservation._id.toString()})`,
+    });
+    // Crash-safety trail: an "open" reservation whose turn never settled
+    // can be found from this line (or from CreditReservation itself).
+    console.info(
+      `[credits] reservation ${reservation._id.toString()} opened: org ${organizationId.toString()}, ${reserved} credits, ${reason}`
+    );
+    return { reservationId: reservation._id.toString(), reserved };
+  }
+  return null;
+}
+
+/**
+ * Settles a reservation to the turn's real cost: refunds the unused part, or
+ * charges the overage if the turn cost more than was reserved. Idempotent —
+ * the "open" → "settled" flip is one atomic conditional update, so a second
+ * call (a retry, a duplicate `finally`) finds nothing open and changes
+ * nothing. Best-effort like `consumeCredits`: never throws.
+ */
+export async function settleReservation(
+  reservationId: string,
+  actualCredits: number
+): Promise<void> {
+  try {
+    const actual = Math.max(0, actualCredits);
+    const reservation = await CreditReservation.findOneAndUpdate(
+      { _id: reservationId, status: "open" },
+      { $set: { status: "settled", actual, settledAt: new Date() } },
+      { new: true }
+    );
+    if (!reservation) return; // already settled (or unknown) — nothing to do
+
+    const difference = reservation.reserved - actual;
+    if (difference === 0) return;
+    await applyDelta(
+      reservation.organization,
+      difference > 0 ? "refund" : "consume",
+      difference,
+      `${reservation.reason} (settled ${reservationId}: actual ${actual})`,
+      reservation.user
+    );
+  } catch (error) {
+    console.error(
+      `[credits] settling reservation ${reservationId} failed:`,
+      error instanceof Error ? error.message : String(error)
+    );
   }
 }
 

@@ -58,6 +58,7 @@ export interface RefreshResult {
     | "ok"
     | "skipped-agent-not-configured"
     | "skipped-no-data"
+    | "skipped-no-credits"
     | "no-recommendations";
   summary?: ReconcileSummary;
 }
@@ -185,6 +186,10 @@ export async function runRefresh(
   } catch (error) {
     if (error instanceof AppError && error.statusCode === 503) {
       return { status: "skipped-agent-not-configured" };
+    }
+    // runAgentPrompt couldn't reserve credits — the workspace is out.
+    if (error instanceof AppError && error.statusCode === 403) {
+      return { status: "skipped-no-credits" };
     }
     throw error;
   }

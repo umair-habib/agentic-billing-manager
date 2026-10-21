@@ -26,6 +26,9 @@ export interface RateLimitOptions {
   max: number;
   /** Namespace so different actions get independent budgets. */
   key: string;
+  /** Whose budget a request counts against: the authenticated user
+   *  (default), or their active workspace — shared by all its members. */
+  scope?: "user" | "organization";
 }
 
 export function rateLimit(options: RateLimitOptions) {
@@ -36,7 +39,12 @@ export function rateLimit(options: RateLimitOptions) {
   };
 
   return (req: Request, _res: Response, next: NextFunction): void => {
-    const who = req.user?._id?.toString() ?? req.ip ?? "anon";
+    const who =
+      (options.scope === "organization"
+        ? req.organization?._id?.toString()
+        : req.user?._id?.toString()) ??
+      req.ip ??
+      "anon";
     const bucketKey = `${options.key}:${who}`;
     const now = Date.now();
 

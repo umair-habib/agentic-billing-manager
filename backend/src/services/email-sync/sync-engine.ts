@@ -701,7 +701,9 @@ async function extractCandidateFields(
   // regardless of the outcome below. Computed once so the caller can also
   // track the run's remaining balance without re-deriving it.
   const creditsUsed = tokensToCredits(extraction.inputTokens, extraction.outputTokens);
-  void consumeCredits(
+  // Awaited (CLAUDE.md §10.3 P1-10) — so the debit has landed before the
+  // run moves on, instead of racing the next run's own balance pre-check.
+  await consumeCredits(
     connection.organization,
     creditsUsed,
     "email_invoice_extraction",
